@@ -44,3 +44,10 @@ dev = [
 Homepage = "https://github.com/banghamid/pddikti_sdk_neofeeder"
 Repository = "https://github.com/banghamid/pddikti_sdk_neofeeder.git"
 Issues = "https://github.com/banghamid/pddikti_sdk_neofeeder/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pddikti_feeder"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

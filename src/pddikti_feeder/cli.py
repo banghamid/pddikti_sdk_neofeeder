@@ -6,37 +6,95 @@ dan melihat skema kamus tabel (GetDictionary).
 
 import argparse
 import json
+import os
 import sys
 from typing import List, Optional
 
 from pddikti_feeder import (
-    AsyncNeoFeederClient,
-    FeederAuthError,
-    FeederConnectionError,
     FeederException,
     NeoFeederClient,
     __version__,
 )
 
 
-def handle_test(args: argparse.Namespace) -> int:
-    """Menguji koneksi dan login ke server Neo Feeder."""
-    client = NeoFeederClient(
+def _create_client(args: argparse.Namespace) -> NeoFeederClient:
+    """Membuat instance NeoFeederClient dari argumen CLI."""
+    return NeoFeederClient(
         base_url=args.url,
         username=args.user,
         password=args.password,
         timeout=args.timeout,
     )
-    if not args.json:
-        print(f"Menguji koneksi ke Neo Feeder pada {args.url}...")
-    res = client.test_connection()
+
+
+def _print_cli_error(exc: Exception) -> None:
+    """Mencetak pesan error aman ke stderr tanpa stack trace."""
+    if isinstance(exc, FeederException):
+        print(f"Error [{exc.error_code}]: {exc.error_desc}", file=sys.stderr)
+    else:
+        print(f"Error [400]: {exc}", file=sys.stderr)
+
+
+def _add_connection_arguments(subparser: argparse.ArgumentParser) -> None:
+    """Menambahkan argumen koneksi standar dengan fallback environment variable."""
+    default_url = os.environ.get("NEOFEEDER_URL") or NeoFeederClient.DEFAULT_BASE_URL
+    default_user = os.environ.get("NEOFEEDER_USER", "")
+    default_password = os.environ.get("NEOFEEDER_PASSWORD", "")
+
+    subparser.add_argument(
+        "--url",
+        default=default_url,
+        help="URL Web Service Feeder (atau env NEOFEEDER_URL)",
+    )
+    subparser.add_argument(
+        "-u",
+        "--user",
+        default=default_user,
+        help="Username Feeder (atau env NEOFEEDER_USER)",
+    )
+    subparser.add_argument(
+        "-p",
+        "--password",
+        default=default_password,
+        help="Password Feeder (disarankan gunakan env NEOFEEDER_PASSWORD)",
+    )
+    subparser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="Batas waktu koneksi (detik)",
+    )
+
+
+def handle_test(args: argparse.Namespace) -> int:
+    """Menguji koneksi dan login ke server Neo Feeder."""
+    try:
+        client = _create_client(args)
+        if not args.json:
+            print(f"Menguji koneksi ke Neo Feeder pada {client.base_url}...")
+        res = client.test_connection()
+    except (FeederException, ValueError) as exc:
+        if args.json:
+            err_payload = {
+                "status": "error",
+                "message": exc.error_desc if isinstance(exc, FeederException) else str(exc),
+                "base_url": args.url,
+                "error_code": exc.error_code if isinstance(exc, FeederException) else 400,
+            }
+            print(json.dumps(err_payload, indent=2, ensure_ascii=False))
+        else:
+            _print_cli_error(exc)
+        return 1
+
+    exit_code = 0 if res.get("status") == "connected" else 1
 
     if args.json:
         print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0
+        return exit_code
 
-    print(f"\n=== HASIL KONEKSI NEO FEEDER ===")
-    print(f"Status        : {res.get('status').upper()}")
+    status_text = str(res.get("status", "error") or "error").upper()
+    print("\n=== HASIL KONEKSI NEO FEEDER ===")
+    print(f"Status        : {status_text}")
     print(f"Pesan         : {res.get('message')}")
     print(f"Target URL    : {res.get('base_url')}")
     if res.get("token_preview"):
@@ -44,50 +102,40 @@ def handle_test(args: argparse.Namespace) -> int:
     if res.get("data"):
         print(f"Data Respon   : {json.dumps(res.get('data'), ensure_ascii=False)}")
     print()
-    return 0 if res.get("status") == "connected" else 1
+    return exit_code
 
 
 def handle_query(args: argparse.Namespace) -> int:
     """Mengeksekusi fungsi RPC Feeder."""
-    client = NeoFeederClient(
-        base_url=args.url,
-        username=args.user,
-        password=args.password,
-        timeout=args.timeout,
-    )
     kwargs = {}
     if args.filter:
         kwargs["filter"] = args.filter
     if args.order:
         kwargs["order"] = args.order
-    if args.limit:
+    if args.limit is not None:
         kwargs["limit"] = args.limit
-    if args.offset:
+    if args.offset is not None:
         kwargs["offset"] = args.offset
 
     try:
+        client = _create_client(args)
         res = client.execute(args.act, **kwargs)
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
-    except FeederException as e:
-        print(f"Error [{e.error_code}]: {e.error_desc}", file=sys.stderr)
+    except (FeederException, ValueError) as exc:
+        _print_cli_error(exc)
         return 1
 
 
 def handle_dict(args: argparse.Namespace) -> int:
     """Mengambil struktur dictionary tabel Feeder."""
-    client = NeoFeederClient(
-        base_url=args.url,
-        username=args.user,
-        password=args.password,
-        timeout=args.timeout,
-    )
     try:
+        client = _create_client(args)
         res = client.get_dictionary(args.table)
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
-    except FeederException as e:
-        print(f"Error [{e.error_code}]: {e.error_desc}", file=sys.stderr)
+    except (FeederException, ValueError) as exc:
+        _print_cli_error(exc)
         return 1
 
 
@@ -102,31 +150,22 @@ def create_parser() -> argparse.ArgumentParser:
 
     # Command: test
     p_test = subparsers.add_parser("test", help="Uji koneksi & login ke server Feeder")
-    p_test.add_argument("--url", default="http://localhost:8100/ws/live2.php", help="URL Web Service Feeder")
-    p_test.add_argument("-u", "--user", default="", help="Username Feeder")
-    p_test.add_argument("-p", "--password", default="", help="Password Feeder")
-    p_test.add_argument("--timeout", type=float, default=60.0, help="Batas waktu koneksi (detik)")
+    _add_connection_arguments(p_test)
     p_test.add_argument("--json", action="store_true", help="Keluarkan output JSON")
 
     # Command: query
     p_query = subparsers.add_parser("query", help="Panggil fungsi RPC Feeder (misal: GetProfilPT, GetBiodataMahasiswa)")
     p_query.add_argument("act", help="Nama aksi / fungsi Feeder")
-    p_query.add_argument("--url", default="http://localhost:8100/ws/live2.php", help="URL Web Service Feeder")
-    p_query.add_argument("-u", "--user", default="", help="Username Feeder")
-    p_query.add_argument("-p", "--password", default="", help="Password Feeder")
+    _add_connection_arguments(p_query)
     p_query.add_argument("--filter", help="Klausa filter (misal: \"id_prodi='123'\")")
     p_query.add_argument("--order", help="Klausa order (misal: \"nim ASC\")")
     p_query.add_argument("--limit", type=int, default=20, help="Batas jumlah record (default: 20)")
     p_query.add_argument("--offset", type=int, default=0, help="Offset record (default: 0)")
-    p_query.add_argument("--timeout", type=float, default=60.0, help="Batas waktu koneksi (detik)")
 
     # Command: dict
     p_dict = subparsers.add_parser("dict", help="Ambil kamus data struktur tabel dari GetDictionary")
     p_dict.add_argument("table", help="Nama fungsi data (misal: 'GetBiodataMahasiswa', 'GetDosen')")
-    p_dict.add_argument("--url", default="http://localhost:8100/ws/live2.php", help="URL Web Service Feeder")
-    p_dict.add_argument("-u", "--user", default="", help="Username Feeder")
-    p_dict.add_argument("-p", "--password", default="", help="Password Feeder")
-    p_dict.add_argument("--timeout", type=float, default=60.0, help="Batas waktu koneksi (detik)")
+    _add_connection_arguments(p_dict)
 
     return parser
 
