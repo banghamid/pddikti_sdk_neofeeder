@@ -5,6 +5,7 @@ dan melihat skema kamus tabel (GetDictionary).
 """
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -15,14 +16,21 @@ from pddikti_feeder import (
     NeoFeederClient,
     __version__,
 )
+from pddikti_feeder.client import _mask_token
+
+_PASSWORD_PROMPT_SENTINEL = "__PROMPT__"
 
 
 def _create_client(args: argparse.Namespace) -> NeoFeederClient:
     """Membuat instance NeoFeederClient dari argumen CLI."""
+    password = args.password
+    if password == _PASSWORD_PROMPT_SENTINEL:
+        password = getpass.getpass("Password Feeder: ")
+
     return NeoFeederClient(
         base_url=args.url,
         username=args.user,
-        password=args.password,
+        password=password,
         timeout=args.timeout,
     )
 
@@ -55,8 +63,10 @@ def _add_connection_arguments(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
         "-p",
         "--password",
+        nargs="?",
+        const=_PASSWORD_PROMPT_SENTINEL,
         default=default_password,
-        help="Password Feeder (disarankan gunakan env NEOFEEDER_PASSWORD)",
+        help="Password Feeder (gunakan -p tanpa nilai untuk prompt aman, atau env NEOFEEDER_PASSWORD)",
     )
     subparser.add_argument(
         "--timeout",
@@ -120,6 +130,8 @@ def handle_query(args: argparse.Namespace) -> int:
     try:
         client = _create_client(args)
         res = client.execute(args.act, **kwargs)
+        if isinstance(res, dict) and isinstance(res.get("data"), dict) and "token" in res["data"]:
+            res = {**res, "data": {**res["data"], "token": _mask_token(res["data"].get("token"))}}
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
     except (FeederException, ValueError) as exc:

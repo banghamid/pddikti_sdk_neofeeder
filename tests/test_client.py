@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from unittest.mock import MagicMock, patch
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from pddikti_feeder import (
     ProfilPerguruanTinggiFeeder,
     ProgramStudiFeeder,
 )
+from pddikti_feeder.client import _MAX_RESPONSE_BYTES
 
 
 def test_feeder_client_init():
@@ -262,3 +264,222 @@ def test_env_variable_fallback_and_timeout_validation(monkeypatch):
         NeoFeederClient(timeout=0)
     with pytest.raises(ValueError):
         NeoFeederClient(timeout=-5)
+
+
+@pytest.mark.parametrize(
+    "ssrf_or_unsafe_url",
+    [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://100.100.100.200/latest/meta-data/",
+        "http://0.0.0.0:8100/ws/live2.php",
+        "http://[fe80::1]:8100/ws/live2.php",
+        "http://[::ffff:169.254.169.254]/ws/live2.php",
+        "http://224.0.0.1/ws/live2.php",
+        "https://user:secret@feeder.kampus.ac.id/ws/live2.php",
+        "https://feeder.kampus.ac.id/ws/live2.php?debug=1",
+        "https://feeder.kampus.ac.id/ws/live2.php#frag",
+        "https://feeder.kampus.ac.id/ws/live2.php\r\nX-Injected: 1",
+    ],
+)
+def test_reject_ssrf_metadata_embedded_creds_and_url_smuggling(ssrf_or_unsafe_url):
+    with pytest.raises(ValueError):
+        NeoFeederClient(base_url=ssrf_or_unsafe_url)
+    with pytest.raises(ValueError):
+        AsyncNeoFeederClient(base_url=ssrf_or_unsafe_url)
+
+
+@pytest.mark.parametrize(
+    "bad_act",
+    [
+        "GetProfilPT; DROP TABLE mahasiswa",
+        "../etc/passwd",
+        "GetProfilPT --",
+        "123InvalidAct",
+        "Get Profil PT",
+    ],
+)
+def test_reject_invalid_act_and_dictionary_fungsi(bad_act):
+    client = NeoFeederClient(username="user1", password="pass1")
+    client._token = "valid_token"
+
+    with pytest.raises(ValueError):
+        client.execute(bad_act)
+    with pytest.raises(ValueError):
+        client.get_dictionary(bad_act)
+    with pytest.raises(ValueError):
+        list(client.iter_records(bad_act))
+
+    async_client = AsyncNeoFeederClient(username="user1", password="pass1")
+    async_client._token = "valid_token"
+
+    async def _runner():
+        with pytest.raises(ValueError):
+            await async_client.execute(bad_act)
+
+    asyncio.run(_runner())
+
+
+@pytest.mark.parametrize(
+    "malicious_filter",
+    [
+        "id_prodi='1'; DROP TABLE mhs--",
+        "1=1 UNION SELECT * FROM users",
+        "id_prodi='1' /* comment */",
+        "id_prodi='1'\x00",
+        "id_prodi='1' OR SLEEP(5)",
+    ],
+)
+def test_reject_sql_injection_in_filter(malicious_filter):
+    client = NeoFeederClient(username="user1", password="pass1")
+    client._token = "valid_token"
+
+    with pytest.raises(ValueError):
+        client.execute("GetBiodataMahasiswa", filter=malicious_filter)
+    with pytest.raises(ValueError):
+        client.get_mahasiswa(filter=malicious_filter)
+    with pytest.raises(ValueError):
+        client.get_daftar_prodi(filter=malicious_filter)
+    with pytest.raises(ValueError):
+        client.get_dosen(filter=malicious_filter)
+
+
+@pytest.mark.parametrize(
+    "malicious_order",
+    [
+        "nim ASC; SELECT 1",
+        "nim --",
+        "nim /* comment */",
+        "nim ASC UNION SELECT 1",
+    ],
+)
+def test_reject_sql_injection_in_order(malicious_order):
+    client = NeoFeederClient(username="user1", password="pass1")
+    client._token = "valid_token"
+
+    with pytest.raises(ValueError):
+        client.execute("GetBiodataMahasiswa", order=malicious_order)
+    with pytest.raises(ValueError):
+        client.get_mahasiswa(order=malicious_order)
+
+
+def test_accept_valid_filter_and_order_clauses():
+    client = NeoFeederClient(username="user1", password="pass1")
+    client._token = "valid_token"
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"error_code": 0, "data": []}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("httpx.Client.post", return_value=mock_resp):
+        rows = client.get_mahasiswa(
+            filter="id_prodi='123' AND nama_mahasiswa LIKE '%Budi%'",
+            order="nama_mahasiswa DESC, nim ASC",
+            limit=50,
+            offset=10,
+        )
+    assert rows == []
+
+
+def test_reject_boolean_and_out_of_bounds_numeric_params():
+    client = NeoFeederClient(username="user1", password="pass1")
+    client._token = "valid_token"
+
+    for bad_limit in (True, False, 0, -1, 10001, "10"):
+        with pytest.raises(ValueError):
+            client.get_mahasiswa(limit=bad_limit)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            client.get_dosen(limit=bad_limit)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            client.execute("GetProfilPT", limit=bad_limit)
+        with pytest.raises(ValueError):
+            list(client.iter_records("GetBiodataMahasiswa", chunk_size=bad_limit))  # type: ignore[arg-type]
+
+    for bad_offset in (True, False, -1, "0"):
+        with pytest.raises(ValueError):
+            client.get_mahasiswa(offset=bad_offset)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            client.execute("GetProfilPT", offset=bad_offset)
+
+    with pytest.raises(ValueError):
+        list(client.iter_records("GetBiodataMahasiswa", max_records=True))  # type: ignore[arg-type]
+
+
+def test_reject_oversized_response_by_header_and_content():
+    client = NeoFeederClient(username="user1", password="pass1")
+    client._token = "valid_token"
+
+    resp_oversized_header = MagicMock()
+    resp_oversized_header.headers = {"Content-Length": str(_MAX_RESPONSE_BYTES + 1)}
+    resp_oversized_header.raise_for_status = MagicMock()
+
+    with patch("httpx.Client.post", return_value=resp_oversized_header):
+        with pytest.raises(FeederException) as exc_info:
+            client.execute("GetProfilPT")
+        assert exc_info.value.error_code == 502
+
+    resp_oversized_body = MagicMock()
+    resp_oversized_body.headers = {}
+    resp_oversized_body.content = b"x" * (_MAX_RESPONSE_BYTES + 1)
+    resp_oversized_body.raise_for_status = MagicMock()
+
+    with patch("httpx.Client.post", return_value=resp_oversized_body):
+        with pytest.raises(FeederException) as exc_info:
+            client.execute("GetProfilPT")
+        assert exc_info.value.error_code == 502
+
+
+def test_sanitize_secrets_in_connection_errors():
+    secret_pw = "super_rahasia_987"
+    secret_tok = "tok_rahasia_xyz_123"
+    client = NeoFeederClient(username="user1", password=secret_pw)
+    client._token = secret_tok
+
+    err = httpx.ConnectError(f"Connection failed with {secret_pw} and {secret_tok}")
+    with patch("httpx.Client.post", side_effect=err):
+        with pytest.raises(FeederConnectionError) as exc_info:
+            client.execute("GetProfilPT")
+        assert secret_pw not in exc_info.value.error_desc
+        assert secret_tok not in exc_info.value.error_desc
+        assert "***" in exc_info.value.error_desc
+
+    async_client = AsyncNeoFeederClient(username="user1", password=secret_pw)
+    async_client._token = secret_tok
+
+    async def _runner():
+        with patch("httpx.AsyncClient.post", side_effect=err):
+            with pytest.raises(FeederConnectionError) as exc_info_async:
+                await async_client.execute("GetProfilPT")
+            assert secret_pw not in exc_info_async.value.error_desc
+            assert secret_tok not in exc_info_async.value.error_desc
+
+    asyncio.run(_runner())
+
+
+def test_get_token_prevents_refresh_race_condition():
+    client = NeoFeederClient(username="user1", password="pass1")
+    client._token = "token_baru_sudah_diperbarui"
+
+    with patch("httpx.Client.post") as mock_post:
+        token = client.get_token(force_refresh=True, stale_token="token_lama")
+        assert token == "token_baru_sudah_diperbarui"
+        mock_post.assert_not_called()
+
+    async_client = AsyncNeoFeederClient(username="user1", password="pass1")
+    async_client._token = "async_token_baru"
+
+    async def _runner():
+        with patch("httpx.AsyncClient.post") as mock_async_post:
+            tok = await async_client.get_token(force_refresh=True, stale_token="async_token_lama")
+            assert tok == "async_token_baru"
+            mock_async_post.assert_not_called()
+
+    asyncio.run(_runner())
+
+
+def test_verify_ssl_false_logs_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="pddikti_feeder"):
+        NeoFeederClient(base_url="https://feeder.kampus.ac.id/ws/live2.php", verify_ssl=False)
+        AsyncNeoFeederClient(base_url="https://feeder.kampus.ac.id/ws/live2.php", verify_ssl=False)
+
+    assert caplog.text.count("verify_ssl=False") == 2

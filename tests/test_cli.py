@@ -90,3 +90,42 @@ def test_cli_env_fallback(monkeypatch, capsys):
     assert parsed.url == "https://feeder.kampus.ac.id/ws/live2.php"
     assert parsed.user == "env_operator"
     assert parsed.password == "env_secret"
+
+
+def test_cli_query_get_token_masks_token(capsys):
+    mock_res = {
+        "error_code": 0,
+        "error_desc": "",
+        "data": {"token": "rahasia_token_panjang_999"},
+    }
+    with patch("pddikti_feeder.client.NeoFeederClient.execute", return_value=mock_res):
+        ret = main(["query", "GetToken"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert data["data"]["token"] == "raha...***"
+        assert "rahasia_token_panjang_999" not in out
+        assert mock_res["data"]["token"] == "rahasia_token_panjang_999"
+
+
+def test_cli_password_interactive_prompt(capsys):
+    mock_res = {"error_code": 0, "error_desc": "", "data": []}
+    with patch("getpass.getpass", return_value="prompted_secret") as mock_getpass:
+        with patch("pddikti_feeder.client.NeoFeederClient.execute", return_value=mock_res):
+            ret = main(["query", "GetProfilPT", "-u", "admin", "-p"])
+            assert ret == 0
+            mock_getpass.assert_called_once_with("Password Feeder: ")
+
+
+def test_cli_query_rejects_sql_injection_filter(capsys):
+    ret = main(["query", "GetBiodataMahasiswa", "--filter", "id_prodi='1'; DROP TABLE mhs"])
+    assert ret == 1
+    err = capsys.readouterr().err
+    assert "Error [400]" in err
+
+
+def test_cli_query_rejects_invalid_limit(capsys):
+    ret = main(["query", "GetProfilPT", "--limit", "-5"])
+    assert ret == 1
+    err = capsys.readouterr().err
+    assert "Error [400]" in err

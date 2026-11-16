@@ -1,16 +1,18 @@
 """Panduan Mulai Cepat (Quickstart) integrasi Neo Feeder PDDIKTI Kampus."""
 
+import os
+
 from pddikti_feeder import NeoFeederClient
 
 
 def main():
     print("=== QUICKSTART INTEGRASI NEO FEEDER KAMPUS ===\n")
 
-    # Inisialisasi client Feeder (default port 8100)
+    # Inisialisasi client Feeder menggunakan environment variable (default port 8100)
     feeder = NeoFeederClient(
-        base_url="http://localhost:8100/ws/live2.php",
-        username="user_siakad",
-        password="password_rahasia",
+        base_url=os.environ.get("NEOFEEDER_URL", "http://localhost:8100/ws/live2.php"),
+        username=os.environ.get("NEOFEEDER_USER", ""),
+        password=os.environ.get("NEOFEEDER_PASSWORD", ""),
         timeout=60.0,
     )
 
